@@ -4,7 +4,11 @@ import 'package:latlong2/latlong.dart';
 import 'package:provider/provider.dart';
 import '../models/crowd_category.dart';
 import '../providers/app_state.dart';
+import '../widgets/api_settings_dialog.dart';
+import '../widgets/city_switcher_modal.dart';
 import '../widgets/heatmap_layer.dart';
+import '../widgets/location_simulator_dialog.dart';
+import '../widgets/notification_banner.dart';
 import '../widgets/place_bottom_sheet.dart';
 import 'snap_camera_screen.dart';
 
@@ -17,14 +21,15 @@ class MapScreen extends StatefulWidget {
 
 class _MapScreenState extends State<MapScreen> {
   final MapController _mapController = MapController();
-  final LatLng _varanasiCenter = const LatLng(25.3076, 83.0105);
   final TextEditingController _searchController = TextEditingController();
 
   final List<String> _filters = [
     'All',
     'Ghat',
     'Temple',
+    'Monument',
     'Market',
+    'Park',
     'Heritage',
     'Calm Only',
   ];
@@ -35,8 +40,11 @@ class _MapScreenState extends State<MapScreen> {
     super.dispose();
   }
 
-  void _recenter() {
-    _mapController.move(_varanasiCenter, 14.5);
+  void _recenter(AppState appState) {
+    _mapController.move(
+      LatLng(appState.selectedCity.centerLat, appState.selectedCity.centerLng),
+      appState.selectedCity.defaultZoom,
+    );
   }
 
   @override
@@ -44,6 +52,7 @@ class _MapScreenState extends State<MapScreen> {
     final appState = Provider.of<AppState>(context);
     final places = appState.filteredPlaces;
     final selectedPlace = appState.selectedPlace;
+    final activeNotif = appState.activeBannerNotification;
 
     return Scaffold(
       backgroundColor: const Color(0xFF0D0F17),
@@ -53,9 +62,9 @@ class _MapScreenState extends State<MapScreen> {
           FlutterMap(
             mapController: _mapController,
             options: MapOptions(
-              initialCenter: _varanasiCenter,
-              initialZoom: 14.5,
-              minZoom: 12.0,
+              initialCenter: LatLng(appState.selectedCity.centerLat, appState.selectedCity.centerLng),
+              initialZoom: appState.selectedCity.defaultZoom,
+              minZoom: 10.0,
               maxZoom: 18.0,
               onTap: (tapPosition, point) {
                 if (selectedPlace != null) {
@@ -138,7 +147,11 @@ class _MapScreenState extends State<MapScreen> {
                                             ? Icons.water_rounded
                                             : place.category == 'Temple'
                                                 ? Icons.temple_hindu_rounded
-                                                : Icons.storefront_rounded,
+                                                : place.category == 'Park'
+                                                    ? Icons.park_rounded
+                                                    : place.category == 'Beach'
+                                                        ? Icons.beach_access_rounded
+                                                        : Icons.storefront_rounded,
                                         color: color,
                                         size: 18,
                                       )
@@ -196,17 +209,17 @@ class _MapScreenState extends State<MapScreen> {
             ],
           ),
 
-          // 2. Top Header & Search Bar
+          // 2. Top Header, Search Bar & Quick Switchers
           Positioned(
             top: MediaQuery.of(context).padding.top + 10,
             left: 14,
             right: 14,
             child: Column(
               children: [
-                // Search Input Card
+                // Search & City Actions Row
                 Container(
                   height: 48,
-                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
                   decoration: BoxDecoration(
                     color: const Color(0xFF131722).withValues(alpha: 0.95),
                     borderRadius: BorderRadius.circular(24),
@@ -223,9 +236,9 @@ class _MapScreenState extends State<MapScreen> {
                         child: TextField(
                           controller: _searchController,
                           style: const TextStyle(color: Colors.white, fontSize: 13),
-                          decoration: const InputDecoration(
-                            hintText: 'Search ghats, temples, markets...',
-                            hintStyle: TextStyle(color: Colors.white38, fontSize: 12),
+                          decoration: InputDecoration(
+                            hintText: 'Search in ${appState.currentCity}...',
+                            hintStyle: const TextStyle(color: Colors.white38, fontSize: 12),
                             border: InputBorder.none,
                           ),
                           onChanged: (val) {
@@ -241,20 +254,62 @@ class _MapScreenState extends State<MapScreen> {
                             appState.setSearchQuery('');
                           },
                         ),
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF2979FF).withValues(alpha: 0.2),
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Text(
-                          appState.currentCity,
-                          style: const TextStyle(
-                            color: Color(0xFF82B1FF),
-                            fontWeight: FontWeight.bold,
-                            fontSize: 11,
+
+                      // City Switcher Button
+                      GestureDetector(
+                        onTap: () {
+                          showModalBottomSheet(
+                            context: context,
+                            backgroundColor: Colors.transparent,
+                            isScrollControlled: true,
+                            builder: (_) => CitySwitcherModal(
+                              onCitySelected: (newCity) {
+                                appState.switchCity(newCity);
+                                _mapController.move(
+                                  LatLng(newCity.centerLat, newCity.centerLng),
+                                  newCity.defaultZoom,
+                                );
+                              },
+                            ),
+                          );
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF2979FF).withValues(alpha: 0.2),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: const Color(0xFF2979FF).withValues(alpha: 0.5)),
+                          ),
+                          child: Row(
+                            children: [
+                              const Icon(Icons.location_city_rounded, color: Color(0xFF82B1FF), size: 14),
+                              const SizedBox(width: 4),
+                              Text(
+                                appState.currentCity,
+                                style: const TextStyle(
+                                  color: Color(0xFF82B1FF),
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 11,
+                                ),
+                              ),
+                              const Icon(Icons.keyboard_arrow_down_rounded, color: Color(0xFF82B1FF), size: 14),
+                            ],
                           ),
                         ),
+                      ),
+
+                      const SizedBox(width: 6),
+
+                      // Developer & API Settings Button
+                      IconButton(
+                        icon: const Icon(Icons.tune_rounded, color: Colors.white70, size: 20),
+                        tooltip: 'Google Maps API & Cloud Sync Settings',
+                        onPressed: () {
+                          showDialog(
+                            context: context,
+                            builder: (_) => const ApiSettingsDialog(),
+                          );
+                        },
                       ),
                     ],
                   ),
@@ -301,22 +356,59 @@ class _MapScreenState extends State<MapScreen> {
                     },
                   ),
                 ),
+
+                // 3. Heads-up Geofence Push Notification Banner
+                if (activeNotif != null) ...[
+                  const SizedBox(height: 8),
+                  NotificationBannerWidget(
+                    notification: activeNotif,
+                    onVerifyTap: () {
+                      final place = appState.places.firstWhere((p) => p.id == activeNotif.placeId);
+                      appState.dismissActiveNotification();
+                      appState.selectPlace(place);
+                    },
+                    onSnapTap: () {
+                      appState.dismissActiveNotification();
+                      Navigator.of(context).push(
+                        MaterialPageRoute(
+                          builder: (_) => SnapCameraScreen(preselectedPlaceId: activeNotif.placeId),
+                        ),
+                      );
+                    },
+                    onDismiss: () => appState.dismissActiveNotification(),
+                  ),
+                ],
               ],
             ),
           ),
 
-          // 3. Floating Action Buttons (Recenter & Post Snap)
+          // 4. Floating Action Buttons (GPS Simulator, Recenter, Post Snap)
           Positioned(
             right: 16,
             bottom: selectedPlace != null ? 360 : 30,
             child: Column(
               children: [
+                // Geofence & GPS Simulator Button
+                FloatingActionButton.small(
+                  heroTag: 'simulator_btn',
+                  backgroundColor: const Color(0xFF1E283E),
+                  foregroundColor: const Color(0xFF00E676),
+                  tooltip: 'Simulate Geofence Arrival',
+                  onPressed: () {
+                    showDialog(
+                      context: context,
+                      builder: (_) => const LocationSimulatorDialog(),
+                    );
+                  },
+                  child: const Icon(Icons.gps_fixed_rounded, size: 20),
+                ),
+                const SizedBox(height: 10),
                 // Recenter Button
                 FloatingActionButton.small(
                   heroTag: 'recenter_btn',
                   backgroundColor: const Color(0xFF191D2C),
                   foregroundColor: Colors.white,
-                  onPressed: _recenter,
+                  onPressed: () => _recenter(appState),
                   child: const Icon(Icons.my_location_rounded, size: 20),
                 ),
                 const SizedBox(height: 12),
@@ -342,7 +434,7 @@ class _MapScreenState extends State<MapScreen> {
             ),
           ),
 
-          // 4. Slide-up Place Details Sheet
+          // 5. Slide-up Place Details Sheet
           if (selectedPlace != null)
             Positioned(
               left: 0,
@@ -361,7 +453,6 @@ class _MapScreenState extends State<MapScreen> {
   }
 }
 
-// Map animation helper extension
 extension MapControllerExtension on MapController {
   void animateTo({required LatLng dest, required double zoom}) {
     move(dest, zoom);

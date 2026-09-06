@@ -1,16 +1,26 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
+import '../models/city.dart';
 import '../models/crowd_category.dart';
 import '../models/place.dart';
 import '../models/snap.dart';
+import '../models/sync_event.dart';
 import '../models/user_profile.dart';
 import '../models/vibe_ping.dart';
+import '../services/city_data.dart';
+import '../services/cloud_sync_service.dart';
 import '../services/crowd_engine.dart';
+import '../services/geofence_service.dart';
+import '../services/google_maps_api_service.dart';
 import '../services/mock_data.dart';
 import '../services/traffic_service.dart';
 
 class AppState extends ChangeNotifier {
   final TrafficService _trafficService = TrafficService();
+  final GoogleMapsApiService googleMapsService = GoogleMapsApiService();
+  final CloudSyncService cloudSyncService = CloudSyncService();
+  final GeofenceService geofenceService = GeofenceService();
   final _uuid = const Uuid();
 
   List<Place> _places = [];
@@ -19,13 +29,17 @@ class AppState extends ChangeNotifier {
   final List<Map<String, dynamic>> _leaderboard = MockData.getLeaderboard();
   final List<VibePing> _vibePings = MockData.getVibePings();
 
+  late City _selectedCity;
   Place? _selectedPlace;
   String _selectedCategoryFilter = 'All';
   String _searchQuery = '';
-  String _currentCity = 'Varanasi';
+  InAppNotification? _activeBannerNotification;
+  StreamSubscription<SyncEvent>? _cloudSyncSub;
+  StreamSubscription<InAppNotification>? _geofenceSub;
 
   AppState() {
     _initData();
+    _setupSubscriptions();
   }
 
   // Getters
@@ -34,13 +48,22 @@ class AppState extends ChangeNotifier {
   UserProfile get userProfile => _userProfile;
   List<Map<String, dynamic>> get leaderboard => _leaderboard;
   List<VibePing> get vibePings => _vibePings;
+  City get selectedCity => _selectedCity;
+  String get currentCity => _selectedCity.name;
   Place? get selectedPlace => _selectedPlace;
   String get selectedCategoryFilter => _selectedCategoryFilter;
   String get searchQuery => _searchQuery;
-  String get currentCity => _currentCity;
+  InAppNotification? get activeBannerNotification => _activeBannerNotification;
+  Place? get currentGeofencedPlace => geofenceService.currentInsidePlace;
+
+  List<Place> get placesForCurrentCity {
+    return _places.where((p) => p.city.toLowerCase().contains(_selectedCity.name.toLowerCase()) ||
+        _selectedCity.name.toLowerCase().contains(p.city.toLowerCase())).toList();
+  }
 
   List<Place> get filteredPlaces {
-    return _places.where((p) {
+    final cityPlaces = placesForCurrentCity;
+    return cityPlaces.where((p) {
       final matchesQuery = _searchQuery.isEmpty ||
           p.name.toLowerCase().contains(_searchQuery.toLowerCase()) ||
           p.description.toLowerCase().contains(_searchQuery.toLowerCase());
@@ -56,8 +79,80 @@ class AppState extends ChangeNotifier {
   }
 
   void _initData() {
-    _places = MockData.getPlaces();
+    _selectedCity = CityData.getSupportedCities().first; // Varanasi default
+    _places = CityData.getAllPlaces();
     _snaps = MockData.getInitialSnaps();
+  }
+
+  void _setupSubscriptions() {
+    // 1. Listen to Real-time Cloud Events
+    _cloudSyncSub = cloudSyncService.eventStream.listen((event) {
+      if (event.originDeviceId == cloudSyncService.deviceId) return; // ignore own echoes
+
+      if (event.type == SyncEventType.snapCreated) {
+        final snap = Snap(
+          id: event.payload['id'],
+          placeId: event.payload['placeId'],
+          placeName: event.payload['placeName'],
+          userId: event.payload['userId'],
+          userName: event.payload['userName'],
+          userAvatar: event.payload['userAvatar'],
+          userRank: event.payload['userRank'] ?? 'Scout',
+          imageUrl: event.payload['imageUrl'],
+          timestamp: DateTime.parse(event.payload['timestamp']),
+          caption: event.payload['caption'],
+          crowdRating: event.payload['crowdRating'],
+          vibeTag: event.payload['vibeTag'],
+        );
+        _snaps.insert(0, snap);
+        _recalculatePlaceCrowdById(event.placeId);
+        notifyListeners();
+      } else if (event.type == SyncEventType.crowdRated) {
+        final placeIndex = _places.indexWhere((p) => p.id == event.placeId);
+        if (placeIndex != -1) {
+          final newScore = event.payload['score'] as int? ?? 50;
+          _places[placeIndex].currentScore = newScore;
+          _places[placeIndex].crowdCategory = CrowdEngine.classifyScore(newScore);
+          _places[placeIndex].advisoryVerdict = CrowdEngine.determineVerdict(newScore);
+          _places[placeIndex].communityVotesCount += 1;
+          notifyListeners();
+        }
+      }
+    });
+
+    // 2. Listen to Geofence Proximity Notifications
+    _geofenceSub = geofenceService.notificationStream.listen((notif) {
+      _activeBannerNotification = notif;
+      notifyListeners();
+    });
+  }
+
+  void dismissActiveNotification() {
+    _activeBannerNotification = null;
+    notifyListeners();
+  }
+
+  void simulateArrivalAtPlace(Place place) {
+    geofenceService.simulateTeleportToPlace(place);
+    selectPlace(place);
+  }
+
+  void switchCity(City city) {
+    _selectedCity = city;
+    _selectedPlace = null;
+    _selectedCategoryFilter = 'All';
+    _searchQuery = '';
+    notifyListeners();
+  }
+
+  void setGoogleMapsApiKey(String key) {
+    googleMapsService.configureApiKey(key, enableLive: true);
+    notifyListeners();
+  }
+
+  void configureSupabaseSync({required String url, required String anonKey}) {
+    cloudSyncService.configureSupabase(url: url, anonKey: anonKey);
+    notifyListeners();
   }
 
   void selectPlace(Place? place) {
@@ -75,11 +170,6 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  void switchCity(String city) {
-    _currentCity = city;
-    notifyListeners();
-  }
-
   List<Snap> getSnapsForPlace(String placeId) {
     return _snaps.where((s) => s.placeId == placeId).toList()
       ..sort((a, b) => b.timestamp.compareTo(a.timestamp));
@@ -94,7 +184,7 @@ class AppState extends ChangeNotifier {
     required String vibeTag,
   }) async {
     final placeIndex = _places.indexWhere((p) => p.id == placeId);
-    final placeName = placeIndex != -1 ? _places[placeIndex].name : 'Varanasi Spot';
+    final placeName = placeIndex != -1 ? _places[placeIndex].name : 'Spot';
 
     final newSnap = Snap(
       id: _uuid.v4(),
@@ -114,17 +204,41 @@ class AppState extends ChangeNotifier {
 
     _snaps.insert(0, newSnap);
 
-    // Gamification Reward: +50 XP for contributing a snap
+    // Gamification Reward: +50 XP
     _addXp(50);
     _userProfile.totalSnapsCount += 1;
-
-    // Advance Quests
     _advanceQuestProgress('q1', 1);
 
     // Recompute place crowd score dynamically
     if (placeIndex != -1) {
       await _recalculatePlaceCrowd(placeIndex);
     }
+
+    // Broadcast Event to Cloud (Supabase/Firebase/Realtime)
+    cloudSyncService.broadcastEvent(
+      SyncEvent(
+        id: _uuid.v4(),
+        type: SyncEventType.snapCreated,
+        cityId: _selectedCity.id,
+        placeId: placeId,
+        payload: {
+          'id': newSnap.id,
+          'placeId': placeId,
+          'placeName': placeName,
+          'userId': _userProfile.id,
+          'userName': _userProfile.name,
+          'userAvatar': _userProfile.avatarUrl,
+          'userRank': _userProfile.rankTitle,
+          'imageUrl': imageUrl,
+          'timestamp': newSnap.timestamp.toIso8601String(),
+          'caption': caption,
+          'crowdRating': crowdRating,
+          'vibeTag': vibeTag,
+        },
+        timestamp: DateTime.now(),
+        originDeviceId: cloudSyncService.deviceId,
+      ),
+    );
 
     notifyListeners();
   }
@@ -137,7 +251,7 @@ class AppState extends ChangeNotifier {
     final place = _places[placeIndex];
     place.communityVotesCount += 1;
 
-    // Gamification: +15 XP for confirming crowd condition
+    // Gamification: +15 XP
     _addXp(15);
     _userProfile.totalVerificationsCount += 1;
     _advanceQuestProgress('q2', 1);
@@ -152,11 +266,24 @@ class AppState extends ChangeNotifier {
                 : 95;
 
     final placeSnaps = getSnapsForPlace(placeId);
-    final trafficScore = await _trafficService.getApproachRoadCongestion(
-      latitude: place.latitude,
-      longitude: place.longitude,
-      placeId: place.id,
-    );
+
+    // Fetch Traffic Score: either Live Google Routes API or TrafficService model
+    int trafficScore = 45;
+    if (googleMapsService.isLiveMode) {
+      final liveScore = await googleMapsService.fetchRoutesTrafficCongestion(
+        originLat: place.latitude + 0.02,
+        originLng: place.longitude + 0.02,
+        destLat: place.latitude,
+        destLng: place.longitude,
+      );
+      trafficScore = liveScore ?? 50;
+    } else {
+      trafficScore = await _trafficService.getApproachRoadCongestion(
+        latitude: place.latitude,
+        longitude: place.longitude,
+        placeId: place.id,
+      );
+    }
 
     // Dynamic fused calculation
     final newScore = CrowdEngine.calculateFusedCrowdScore(
@@ -171,15 +298,26 @@ class AppState extends ChangeNotifier {
     place.advisoryVerdict = CrowdEngine.determineVerdict(newScore);
     place.approachTrafficScore = trafficScore;
 
-    // Check if place is quiet to advance quiet scout quest
     if (place.crowdCategory == CrowdCategory.calm) {
       _advanceQuestProgress('q3', 1);
     }
 
+    // Broadcast Event to Cloud
+    cloudSyncService.broadcastEvent(
+      SyncEvent(
+        id: _uuid.v4(),
+        type: SyncEventType.crowdRated,
+        cityId: _selectedCity.id,
+        placeId: placeId,
+        payload: {'score': newScore, 'rating': ratingLevel},
+        timestamp: DateTime.now(),
+        originDeviceId: cloudSyncService.deviceId,
+      ),
+    );
+
     notifyListeners();
   }
 
-  /// Upvote a community snap
   void toggleSnapUpvote(String snapId) {
     final snapIndex = _snaps.indexWhere((s) => s.id == snapId);
     if (snapIndex != -1) {
@@ -190,25 +328,34 @@ class AppState extends ChangeNotifier {
       } else {
         snap.upvotes += 1;
         snap.hasUserUpvoted = true;
-        _addXp(5); // +5 XP for engaging
+        _addXp(5);
       }
       notifyListeners();
     }
   }
 
-  /// Re-run algorithm for a place
   Future<void> _recalculatePlaceCrowd(int placeIndex) async {
     final place = _places[placeIndex];
     final recentPlaceSnaps = getSnapsForPlace(place.id);
     place.distinctSnapCountLastHour = recentPlaceSnaps.length;
 
-    final trafficScore = await _trafficService.getApproachRoadCongestion(
-      latitude: place.latitude,
-      longitude: place.longitude,
-      placeId: place.id,
-    );
+    int trafficScore = 40;
+    if (googleMapsService.isLiveMode) {
+      final live = await googleMapsService.fetchRoutesTrafficCongestion(
+        originLat: place.latitude + 0.02,
+        originLng: place.longitude + 0.02,
+        destLat: place.latitude,
+        destLng: place.longitude,
+      );
+      trafficScore = live ?? 45;
+    } else {
+      trafficScore = await _trafficService.getApproachRoadCongestion(
+        latitude: place.latitude,
+        longitude: place.longitude,
+        placeId: place.id,
+      );
+    }
 
-    // Compute average snap rating
     double avgSnapRating = 50;
     if (recentPlaceSnaps.isNotEmpty) {
       final sum = recentPlaceSnaps.fold<int>(0, (sum, s) => sum + s.crowdRating);
@@ -239,7 +386,13 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Ask community for real-time vibe update
+  Future<void> _recalculatePlaceCrowdById(String placeId) async {
+    final index = _places.indexWhere((p) => p.id == placeId);
+    if (index != -1) {
+      await _recalculatePlaceCrowd(index);
+    }
+  }
+
   void createVibePing(String placeId, String question) {
     final placeIndex = _places.indexWhere((p) => p.id == placeId);
     final placeName = placeIndex != -1 ? _places[placeIndex].name : 'Location';
@@ -258,7 +411,6 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Respond to a vibe ping
   void answerVibePing(String pingId, String crowdStatus, String comment) {
     final pingIndex = _vibePings.indexWhere((p) => p.id == pingId);
     if (pingIndex != -1) {
@@ -272,12 +424,11 @@ class AppState extends ChangeNotifier {
       );
 
       _vibePings[pingIndex].answers.insert(0, answer);
-      _addXp(20); // +20 XP for helping a traveler
+      _addXp(20);
       notifyListeners();
     }
   }
 
-  /// Claim quest reward
   void claimQuestReward(String questId) {
     final qIndex = _userProfile.quests.indexWhere((q) => q.id == questId);
     if (qIndex != -1) {
@@ -292,14 +443,11 @@ class AppState extends ChangeNotifier {
 
   void _addXp(int amount) {
     _userProfile.xp += amount;
-    // Update ranking in city leaderboard
     final myEntryIndex = _leaderboard.indexWhere((e) => e['name'].toString().contains('You'));
     if (myEntryIndex != -1) {
       _leaderboard[myEntryIndex]['xp'] = _userProfile.xp;
       _leaderboard[myEntryIndex]['tier'] = _userProfile.rankTitle;
-      // Sort leaderboard
       _leaderboard.sort((a, b) => (b['xp'] as int).compareTo(a['xp'] as int));
-      // Re-assign ranks
       for (int i = 0; i < _leaderboard.length; i++) {
         _leaderboard[i]['rank'] = i + 1;
         if (_leaderboard[i]['name'].toString().contains('You')) {
@@ -319,5 +467,14 @@ class AppState extends ChangeNotifier {
         );
       }
     }
+  }
+
+  @override
+  void dispose() {
+    _cloudSyncSub?.cancel();
+    _geofenceSub?.cancel();
+    cloudSyncService.dispose();
+    geofenceService.dispose();
+    super.dispose();
   }
 }
